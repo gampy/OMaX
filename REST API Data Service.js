@@ -1,5 +1,5 @@
 // DESCRIPTION: OMaX Server Runtime. Called from REST API Gateway.
-// VERSION: 1.1
+// VERSION: 1.1.1
 // CREATED BY: Alexey Zaitsev, May 2025
 // MODIFIED BY:
 
@@ -98,6 +98,7 @@ class DataService {
       this.filters = filters;
       this.dimensions = { rows: [], columns: [] };
       this.message = "";
+      this.errorResponse = null;
     }
 
   /**
@@ -117,6 +118,7 @@ class DataService {
     } = content;
 
     const ds = DataService.create({ type, name, view: view || undefined, filters, excludeDimensions });
+    if (ds.errorResponse) return ds.errorResponse;
 
     switch (action) {
       case Action.GET: {
@@ -164,12 +166,18 @@ class DataService {
       case SourceType.MULTICUBE:  ds = new Multicube(type, name, view, filters); break; 
       case SourceType.CUBES:      ds = new Cubes(type, name, filters); break; 
       default:
-        throw new Error(`Unsupported source type "${type}"`);
+        ds = new DataService(type);
+        ds.errorResponse = { status: "ERROR", data: {}, message: `Unsupported source type "${type}"` };
+        return ds;
     }
     ds.excludeDimensions = new Set(excludeDimensions);
-    ds.grid = ds.grid();
-    if (ds.grid !== undefined && ds.grid !== null) {
-      ds.dimensions = ds.getDimensionNames();
+    try {
+      ds.grid = ds.grid();
+      if (ds.grid !== undefined && ds.grid !== null) {
+        ds.dimensions = ds.getDimensionNames();
+      }
+    } catch (e) {
+      ds.errorResponse = { status: "ERROR", data: {}, message: String(e.message || e) };
     }
     return ds;
   }
