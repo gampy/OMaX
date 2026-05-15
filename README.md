@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://exploredata.pro/wp-content/uploads/logo/logo_310x310.png" width="96" alt="ExploreData logo" />
+  <img src="https://exploredata.pro/wp-content/uploads/logo/logo_270x270.png" width="96" alt="ExploreData logo" />
 </p>
 
 <h1 align="center">OMaX</h1>
@@ -35,10 +35,9 @@ OMaX bridges **Optimacros** (a CPM/planning platform) and **Microsoft Excel** wi
 
 ### Server side
 
-1. In your Optimacros model, open **Scripts** and create two scripts from the files in this repository:
+In your Optimacros model, open **Scripts** and create two scripts from the files in this repository:
    - `REST API Gateway 2.2.js` — assign it to a web service **Endpoint**.
-   - `REST API Data Service.js` — no endpoint needed; it is invoked by the Gateway.
-2. Note the Endpoint URL (e.g. `https://<your-host>/api/v1/script/<endpoint-name>`).
+   - `REST API Data Service.js` — invoked by the Gateway.
 
 ### Client side
 
