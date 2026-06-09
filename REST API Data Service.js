@@ -1,5 +1,5 @@
 // DESCRIPTION: OMaX Server Runtime. Called from REST API Gateway.
-// VERSION: 1.1.1
+// VERSION: 1.2.1 (OMaX 0.60+)
 // CREATED BY: Alexey Zaitsev, May 2025
 // MODIFIED BY:
 
@@ -88,7 +88,7 @@ class Request {
 /**
  * Base class for the data service types.
  */
-class DataService {  
+class DataService {
   /**
    * @param {string} type
    * @param {Object<string,string[]>} [filters]
@@ -96,7 +96,7 @@ class DataService {
     constructor(type, filters = {}) {
       this.type = type;
       this.filters = filters;
-      this.dimensions = { rows: [], columns: [] };
+      this.dimensions = { pageSelectors: [], rows: [], columns: [] };
       this.message = "";
       this.errorResponse = null;
     }
@@ -152,7 +152,7 @@ class DataService {
    * @param {string} [options.name]     - Name of the multicube or list (if applicable)
    * @param {string} [options.view]     - Name of the view (for LIST and MULTICUBE)
    * @param {Object<string,string[]>} [options.filters] - Filters to apply to the data
-   * @param {string[]} [options.excludeDimensions] - Dimension names to exclude from rows/columns
+   * @param {string[]} [options.excludeDimensions] - Dimension names to exclude from page selectors / rows / columns
    */
   static create({ type, name, view, filters, excludeDimensions = [] }) {
     let ds;
@@ -198,7 +198,7 @@ class DataService {
    */
   applyColumnsFilter(pivot, colDimension) {
     const values = this.filters[colDimension];
-    return values && values.length ? pivot.columnsFilter(values) : pivot;
+    return values?.length ? pivot.columnsFilter(values) : pivot;
   }
 
   /**
@@ -219,25 +219,34 @@ class DataService {
   }
 
   /**
-   * Retrieves the rows and column dimensions names.
-   * @returns {{ rows: string[], columns: string[] }}
+   * Retrieves the page selector, row, column dimension names.
+   * @returns {{ pageSelectors: string[], rows: string[], columns: string[] }}
    */
     getDimensionNames() {
       const definitions = this.grid.getDefinitionInfo();
       const exclude = this.excludeDimensions || new Set();
+      const pageSelectors = definitions.getPageSelectors().filter(d => !exclude.has(d.getDimensionEntity().name())).map(d => d.getDimensionEntity().name());
       const rows = definitions.getRowDimensions().filter(d => !exclude.has(d.getDimensionEntity().name())).map(d => d.getDimensionEntity().name());
       const columns = definitions.getColumnDimensions().filter(d => !exclude.has(d.getDimensionEntity().name())).map(d => d.getDimensionEntity().name());
-      return {rows, columns};
+      return { pageSelectors, rows, columns };
     }
 
   /**
    * Validates that JSON dimensions match the grid dimensions (sets must be identical).
-   * @param {{ rows: string[], columns: string[] }} jsonDimensions
+   * @param {{ pageSelectors?: string[], rows: string[], columns: string[] }} jsonDimensions
    * @returns {boolean}
    */
   validateDimensions(jsonDimensions) {
-    const jsonSet = new Set([...(jsonDimensions.rows || []), ...(jsonDimensions.columns || [])]);
-    const gridSet = new Set([...this.dimensions.rows, ...this.dimensions.columns]);
+    const jsonSet = new Set([
+      ...(jsonDimensions.pageSelectors || []),
+      ...(jsonDimensions.rows || []),
+      ...(jsonDimensions.columns || []),
+    ]);
+    const gridSet = new Set([
+      ...(this.dimensions.pageSelectors || []),
+      ...this.dimensions.rows,
+      ...this.dimensions.columns,
+    ]);
 
     if (jsonSet.size !== gridSet.size || ![...jsonSet].every(d => gridSet.has(d))) {
       this.message = `View dimensions mismatch: client [${[...jsonSet].join(", ")}] vs server [${[...gridSet].join(", ")}]`;
@@ -302,13 +311,14 @@ class DataService {
    * @param {boolean} lablesOnly
    * @returns {object}
    */
-    getData(lablesOnly = true, separator = "||", maxCells = 5000) {
+    getData(lablesOnly = true, separator = "||", maxCells = 5000, chunkSize = 5000, rowCount = 5000) {
 
       const data = {};
       const items = {};
       this.message = "Data loaded";
       let cellCount = 0;        // Counter for cells
       const ordinalCount = {};  // Counter for ordinal per dimension
+      const dimItemsKeys = {};  // Set of keys already added to items[dimension]
 
       try {
         // Helper: bind makeKey with separator
@@ -317,29 +327,53 @@ class DataService {
         // Helper: check if element passes the filter
         const checkFilter = (dimension, matchTarget) => {
           const allowedSet = this.filters[dimension];
-          if (allowedSet && !allowedSet.includes(matchTarget)) {
+          if (allowedSet?.length && !allowedSet.includes(matchTarget)) {
             return false;
           }
           return true;
         };
 
-        // Helper: add element to json "items" object
+        /**
+         * Appends one member to items[dimension] (unique keys per dimension).
+         * @param {string} key - Member key from makeKey() (label or label||name)
+         * @param {string|null} parent - Parent member key or null
+         * @param {string} dimension - Dimension name
+         */
         const addToItems = (key, parent, dimension) => {
-          if (!(key in items)) {
+          if (!dimItemsKeys[dimension]) dimItemsKeys[dimension] = new Set();
+          if (!items[dimension]) items[dimension] = [];
+
+          if (!dimItemsKeys[dimension].has(key)) {
+            dimItemsKeys[dimension].add(key);
             if (!ordinalCount[dimension]) ordinalCount[dimension] = 0;
-            
-            items[key] = { 
-              parent: parent,
-              dimension: dimension,
-              ordinal: ++ordinalCount[dimension]
-            };
+            items[dimension].push({
+              key,
+              parent,
+              ordinal: ++ordinalCount[dimension],
+            });
           }
 
           this.onItemAdded(key, dimension);
         };
 
-        // Process each chunk from grid generator
-        const generator = this.grid.range().generator();
+        const pageSelectorDimensionsSet = new Set(this.dimensions.pageSelectors || []);
+        const gridPageSelectors = this.grid
+          .getDefinitionInfo()
+          .getPageSelectors()
+          .filter((d) => pageSelectorDimensionsSet.has(d.getDimensionEntity().name()));
+
+        for (const pageSelector of gridPageSelectors) {
+          const dimensionName = pageSelector.getDimensionEntity().name();
+          const selected = pageSelector.getSelectedEntity();
+          if (!selected) continue;
+          const key = makeKey(selected);
+          const matchTarget = lablesOnly ? selected.label() : key;
+          if (!checkFilter(dimensionName, matchTarget)) continue;
+          addToItems(key, this.getKeyById(selected.parentLongId(), separator), dimensionName);
+        }
+
+        // Process rows and columns
+        const generator = this.grid.range(0, rowCount, 0, -1).generator(chunkSize);
 
         for (const chunk of generator) {
           const axis0Groups = chunk.rows().all();
@@ -362,8 +396,10 @@ class DataService {
           }
           
           if (!hasAxis0 && hasAxis1) {
-            // Inverted view: only columns, no rows
-            // Treat columns as primary axis (axis0)
+            if (this.dimensions.rows.length > 0) continue;
+
+            // Genuine inverted view: no row dimensions, columns are the only axis.
+            // Treat columns as primary axis (axis0).
             const result = this.processViewDataRead({
               chunk,
               axis0Groups: axis1Groups,
@@ -413,11 +449,11 @@ class DataService {
   /**
    * Sets data to the grid from JSON.
    * @param {object} data - Nested JSON data matching grid dimensions
-   * @param {{ rows: string[], columns: string[] }} dimensions - Dimensions from request
+   * @param {{ pageSelectors?: string[], rows: string[], columns: string[] }} dimensions - Dimensions from request
    * @param {string} separator - Separator for label||name keys
    * @returns {{ status: string, data: { updated: number }, message: string }}
    */
-  setData(data, dimensions, separator = "||") {
+  setData(data, dimensions, separator = "||", chunkSize = 5000, rowCount = 5000) {
     if (!this.validateDimensions(dimensions)) {
       return { status: "ERROR", data: { updated: 0 }, message: this.message };
     }
@@ -439,7 +475,7 @@ class DataService {
         return this.makeMdxKey(orderedKeys);
       };
 
-      const generator = this.grid.range().generator();
+      const generator = this.grid.range(0, rowCount, 0, -1).generator(chunkSize);
 
       for (const chunk of generator) {
         const rowGroups = chunk.rows().all();
@@ -514,8 +550,8 @@ class DataService {
   /**
    * Process view data for reading with configurable axes
    * @private
-   * @param {Object} config - Configuration object
-   * @returns {Object} - { cellCount }
+   * @param {Object} config
+   * @returns {{ cellCount: number }}
    */
   processViewDataRead(config) {
     const {
@@ -631,7 +667,7 @@ class DataService {
   }
 
 /**
- * Finds the real lists among dimension names and assigns them to this.lists.{rows, columns}
+ * Finds the real lists among dimension names and assigns them to this.lists.{pageSelectors, rows, columns}
  */
   findLists() {
     if (!this.dimensions) return;
@@ -705,6 +741,7 @@ class DataService {
     return {
       rows:    resolveDimension(this.dimensions.rows    || []),
       columns: resolveDimension(this.dimensions.columns || []),
+      pageSelectors: resolveDimension(this.dimensions.pageSelectors || []),
     };
   }
 }
@@ -900,8 +937,8 @@ class Multicube extends DataService {
    * @param {number} maxCells
    * @returns {object}
    */
-  getData(lablesOnly = true, separator = "||", maxCells = 5000) {
-    const result = super.getData(lablesOnly, separator, maxCells);
+  getData(lablesOnly = true, separator = "||", maxCells = 5000, chunkSize = 5000, rowCount = 5000) {
+    const result = super.getData(lablesOnly, separator, maxCells, chunkSize, rowCount);
     
     if (this.viewCubes.size > 0) {
       this.cubes = this.getCubesInfo([...this.viewCubes]);
@@ -982,16 +1019,17 @@ class DimensionLookup {
   /**
    * Scans the model and returns a Set of ALL list names.
    *
-   * @param {number} [chunk=5000] - Maximum row chunk size for the generator.
+   * @param {number} [chunkSize=5000] - Maximum row chunk size for the generator.
+   * @param {number} [rowCount=5000] - Row count for grid.range().
    * @returns {Set<string>} A set of unique list names.
    */
-  static getAllListNames(chunk = 5000) {
+  static getAllListNames(chunkSize = 5000, rowCount = 5000) {
     const grid = om.lists.listsTab().pivot().create();
-    const generator = grid.range().generator(chunk);
+    const generator = grid.range(0, rowCount, 0, -1).generator(chunkSize);
 
     const names = new Set();
 
-    for (const chunk of generator ) {
+    for (const chunk of generator) {
       chunk.rows().all().forEach(labelsGroup  => {
         names.add(labelsGroup.first().name());
       });
@@ -1023,10 +1061,11 @@ class DimensionLookup {
    * @param {string} listName
    * @param {string} subsetName
    * @param {Map<string, boolean>} [cache=new Map()] - Optional cache (mutated in-place).
-   * @param {number} [chunk=5000] - Generator chunk size for scanning.
+   * @param {number} [chunkSize=5000] - Generator chunk size for scanning.
+   * @param {number} [rowCount=5000] - Row count for grid.range().
    * @returns {boolean} True if the subset exists, false otherwise.
    */
-  static hasSubset(listName, subsetName, cache = new Map(), chunk = 5000) {
+  static hasSubset(listName, subsetName, cache = new Map(), chunkSize = 5000, rowCount = 5000) {
     // Serialize the pair as a JSON tuple to avoid collisions.
     const cacheKey = JSON.stringify([listName, subsetName]);
 
@@ -1034,7 +1073,7 @@ class DimensionLookup {
 
     const tab  = this.getDimensionSubsetTab(listName);
     const grid = tab.pivot().create();
-    const generator  = grid.range().generator(chunk);
+    const generator = grid.range(0, rowCount, 0, -1).generator(chunkSize);
 
     for (const chunk of generator) {
       for (const labelsGroup of chunk.rows().all()) {

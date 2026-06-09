@@ -3,7 +3,7 @@
 ---
 
 <p align="center">
-  <img src="https://exploredata.pro/wp-content/uploads/logo/logo_270x270.png" height="40" alt="ExploreData logo" />&nbsp;&nbsp;<font size="7" color="#156082"><strong>OMaX</strong></font>
+  <img src="https://exploredata.pro/wp-content/uploads/logo/logo_270x270.png" height="30" alt="ExploreData logo" />&nbsp;&nbsp;<font size="6" color="#5DB6C7"><strong>OMaX</strong></font>
 </p>
 
 <p align="center">Excel client for <a href="https://optimacros.com">Optimacros</a></p>
@@ -34,7 +34,7 @@ Current version capabilities:
 
 | File | Description |
 |---|---|
-| `OMaX.xlsm` | Main client workbook — Power Query + VBA |
+| `OMaX.xlsm` | Main client workbook |
 | `REST API Gateway.js` | Optimacros script: validates and dispatches incoming HTTP requests |
 | `REST API Data Service.js` | Optimacros script: reads/writes data from multicubes and lists |
 
@@ -47,7 +47,7 @@ In your Optimacros model, open **Scripts** and create two scripts from the files
 - `REST API Gateway.js`
 - `REST API Data Service.js`
 
-In the **Admin Panel → API Services**, create a new web service Endpoint and assign `REST API Gateway.js` to it.
+In the **Admin Panel -> API Services**, create a new web service Endpoint and assign `REST API Gateway.js` to it.
 
 ### Client side
 
@@ -66,7 +66,7 @@ In the **Admin Panel → API Services**, create a new web service Endpoint and a
 | **Load Data** | Fetches data for the selected multicube view from Optimacros |
 | **Build Pivot** | Builds or refreshes the OLAP PivotTable from loaded data |
 | **Sort** | Sorts dimension members according to their order in the Optimacros source |
-| **Edit Data** | Activates Edit Mode (switches to the DataPivotEdit sheet) |
+| **Edit Data** | Activates Edit Mode |
 | **Hide Empty / Show Empty** | Toggles display of empty rows and columns in the PivotTable |
 | **Show Formulas / Hide Formulas** | Toggles visibility of Notes (cube formulas) for PivotTable cells |
 | **Tabular View / Outline View** | Switches the PivotTable layout mode |
