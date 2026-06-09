@@ -59,7 +59,7 @@ In the **Admin Panel -> API Services**, create a new web service Endpoint and as
 
 ## Usage
 
-### DataPivot — View Mode
+### DataPivot -> View Mode
 
 | Button | Action |
 |---|---|
@@ -72,9 +72,9 @@ In the **Admin Panel -> API Services**, create a new web service Endpoint and as
 | **Tabular View / Outline View** | Switches the PivotTable layout mode |
 
 > Double-clicking a PivotTable cell also activates Edit Mode.  
-> While in Edit Mode this sheet is protected — data changes, filtering, and sorting are disabled.
+> While in Edit Mode this sheet is protected - data changes, filtering, and sorting are disabled.
 
-### DataPivotEdit — Edit Mode
+### DataPivotEdit ->Edit Mode
 
 | Button | Action |
 |---|---|
