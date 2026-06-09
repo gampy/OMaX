@@ -3,7 +3,7 @@
 ---
 
 <p align="center">
-  <img src="https://exploredata.pro/wp-content/uploads/logo/logo_270x270.png" height="30" alt="ExploreData logo" />&nbsp;&nbsp;<font size="6" color="#5DB6C7"><strong>OMaX</strong></font>
+  <img src="https://exploredata.pro/wp-content/uploads/logo/logo_270x270.png" height="36" alt="ExploreData logo" />&nbsp;&nbsp;<img src="assets/title.svg" height="36" alt="OMaX" />
 </p>
 
 <p align="center">Excel client for <a href="https://optimacros.com">Optimacros</a></p>
