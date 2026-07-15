@@ -1,6 +1,6 @@
 // DESCRIPTION: OMaX Server Runtime. Called from REST API Gateway.
-// VERSION: 1.2.1 (OMaX 0.60+)
-// CREATED BY: Alexey Zaitsev, May 2025
+// VERSION: 1.3.2 (OMaX 0.62)
+// CREATED BY: Alexey Zaitsev
 // MODIFIED BY:
 
 
@@ -18,19 +18,6 @@ const Action = Object.freeze({
   PUT: 'put',
 });
 
-/**
- * Source types enum
- */
-const SourceType = Object.freeze({
-  PING: 'PING',
-  LISTS: 'LISTS',
-  MULTICUBES: 'MULTICUBES',
-  VERSIONS: 'VERSIONS',
-  TIME: 'TIME',
-  LIST: 'LIST',
-  MULTICUBE: 'MULTICUBE',
-  CUBES: 'CUBES',
-});
 
 /**
  * Request builder for nested requests.
@@ -89,6 +76,200 @@ class Request {
  * Base class for the data service types.
  */
 class DataService {
+
+  /** Source type identifiers. */
+  static SourceType = Object.freeze({
+    PING:       'PING',
+    LISTS:      'LISTS',
+    MULTICUBES: 'MULTICUBES',
+    VERSIONS:   'VERSIONS',
+    TIME:       'TIME',
+    LIST:       'LIST',
+    MULTICUBE:  'MULTICUBE',
+    CUBES:      'CUBES',
+  });
+
+  static Scope = {
+
+    Dimensions: class {
+      /**
+       * @param {DataService} ds
+       * @param {{ lists?: boolean }} params
+       */
+      constructor(ds, params) { this.ds = ds; this.params = params; }
+
+      /**
+       * @returns {{ status: string, dimensions: object, rowCount?: number, columnCount?: number, lists?: object }}
+       */
+      read() {
+        const { ds, params } = this;
+        if (!ds.grid) return { status: "OK", dimensions: ds.dimensions };
+        const response = {
+          status: "OK",
+          dimensions: ds.dimensions,
+          rowCount: ds.grid.rowCount(),
+          columnCount: ds.grid.columnCount()
+        };
+        if (ds instanceof Multicube && params.lists) response.lists = ds.findLists();
+        return response;
+      }
+    },
+
+    Items: class {
+      /**
+       * @param {DataService} ds
+       * @param {{ lablesOnly?: boolean, separator?: string, maxCells?: number, chunkSize?: number, rowCount?: number, rowStart?: number }} params
+       */
+      constructor(ds, params) { this.ds = ds; this.params = params; }
+
+      /**
+       * @returns {{ status: string, items: object, cubes?: object }}
+       */
+      read() {
+        const { ds, params } = this;
+        const { lablesOnly, separator, maxCells, chunkSize, rowCount, rowStart } = params;
+        const items = {};
+        const ordinalCount = {};
+        const dimItemsKeys = {};
+
+        // Appends one member to items[dimension], deduped by key.
+        const append = (lbl, dim) => {
+          const key = ds.makeKey(lbl, separator); // cheap: reads label()/name() off the loaded label
+          if (!dimItemsKeys[dim]) dimItemsKeys[dim] = new Set();
+          if (!items[dim]) items[dim] = [];
+          if (!dimItemsKeys[dim].has(key)) {
+            dimItemsKeys[dim].add(key);
+            if (!ordinalCount[dim]) ordinalCount[dim] = 0;
+            const parent = ds.getKeyById(lbl.parentLongId(), separator); // expensive: only for new keys
+            items[dim].push({ key, parent, ordinal: ++ordinalCount[dim] });
+            ds.onItemAdded(key, dim);
+          }
+        };
+
+        try {
+          // Page selectors: cross-reference with ds.dimensions.pageSelectors
+          const pageSelectorSet = new Set(ds.dimensions.pageSelectors || []);
+          ds.grid.getDefinitionInfo().getPageSelectors()
+            .filter(d => pageSelectorSet.has(d.getDimensionEntity().name())) // excludes excludeDimensions
+            .forEach(pageSelector => {
+              const dim = pageSelector.getDimensionEntity().name();
+              const selected = pageSelector.getSelectedEntity();
+              if (!selected) return;
+              const target = lablesOnly ? selected.label() : ds.makeKey(selected, separator);
+              if (ds.passesFilter(dim, target)) append(selected, dim);
+            });
+
+          // Header-only traversal. Returns true when the group passed all filters
+          const collectGroup = (group, dims) => {
+            const labels = group.all();
+            // A row/column is included only if all of its labels pass the filters.
+            for (let i = 0; i < labels.length; i++) {
+              if (!ds.passesFilter(dims[i], lablesOnly ? labels[i].label() : ds.makeKey(labels[i], separator))) return false;
+            }
+            labels.forEach((lbl, i) => append(lbl, dims[i]));
+            return true;
+          };
+
+          const generator = ds.grid.range(rowStart, rowCount, 0, -1).generator(chunkSize);
+          let columnsDone = false;
+          // Count only filter-passing columns/rows for the maxCells
+          let columnCount = 0;
+          let rowsProcessed = 0;
+
+          for (const chunk of generator) {
+            const rowGroups = chunk.rows().all();
+            const colGroups = chunk.columns().all();
+
+            // Columns are identical across row-band chunks: collect and count once.
+            if (!columnsDone && colGroups && colGroups.length > 0) {
+              columnCount = colGroups.reduce((count, group) => count + (collectGroup(group, ds.dimensions.columns) ? 1 : 0), 0);
+              columnsDone = true;
+            }
+
+            if (rowGroups) {
+              rowGroups.forEach(group => {
+                if (maxCells > 0 && columnCount > 0 && rowsProcessed * columnCount > maxCells) return;
+                if (collectGroup(group, ds.dimensions.rows)) rowsProcessed++;
+              });
+            }
+          }
+
+          ds.afterRead();
+
+          const response = { status: "OK", items };
+          if (ds.cubes) response.cubes = ds.cubes;
+          return response;
+
+        } catch (e) {
+          return { status: "ERROR", items };
+        }
+      }
+    },
+
+    Cells: class {
+      /**
+       * @param {DataService} ds
+       * @param {{ lablesOnly?: boolean, separator?: string, maxCells?: number, chunkSize?: number, rowCount?: number, rowStart?: number }} params
+       */
+      constructor(ds, params) { this.ds = ds; this.params = params; }
+
+      /**
+       * @returns {{ status: string, cells: object, message: string }}
+       */
+      read() {
+        const { ds, params } = this;
+        const { lablesOnly, separator, maxCells, chunkSize, rowCount, rowStart } = params;
+        const cells = {};
+
+        ds.message = "Cells loaded";
+        let cellCount = 0;
+
+        try {
+          const generator = ds.grid.range(rowStart, rowCount, 0, -1).generator(chunkSize);
+
+          for (const chunk of generator) {
+            const axis0Groups = chunk.rows().all();
+            const axis1Groups = chunk.columns().all();
+            const hasAxis0 = axis0Groups && axis0Groups.length > 0;
+            const hasAxis1 = axis1Groups && axis1Groups.length > 0;
+
+            if (!hasAxis0 && !hasAxis1) {
+              const cellValue = chunk.cells().all()[0]?.getValue();
+              if (cellValue !== undefined) { cells['Value'] = cellValue; cellCount++; }
+              continue;
+            }
+
+            if (!hasAxis0 && hasAxis1) {
+              if (ds.dimensions.rows.length > 0) continue;
+              // Columns-only view: treat columns as primary axis.
+              const r = ds.traverseCells({
+                chunk, axis0Groups: axis1Groups, axis1Groups: null,
+                axis0Dimensions: ds.dimensions.columns, axis1Dimensions: null,
+                data: cells, lablesOnly, separator, maxCells, cellCount
+              });
+              cellCount = r.cellCount;
+              continue;
+            }
+
+            const r = ds.traverseCells({
+              chunk, axis0Groups, axis1Groups,
+              axis0Dimensions: ds.dimensions.rows, axis1Dimensions: ds.dimensions.columns,
+              data: cells, lablesOnly, separator, maxCells, cellCount
+            });
+            cellCount = r.cellCount;
+          }
+
+          ds.afterRead();
+          return { status: "OK", cells, message: ds.message };
+
+        } catch (e) {
+          return { status: "ERROR", cells, message: String(e.message || e) };
+        }
+      }
+    }
+
+  };
+
   /**
    * @param {string} type
    * @param {Object<string,string[]>} [filters]
@@ -99,6 +280,7 @@ class DataService {
       this.dimensions = { pageSelectors: [], rows: [], columns: [] };
       this.message = "";
       this.errorResponse = null;
+      this.useWithoutValues = false;
     }
 
   /**
@@ -110,36 +292,46 @@ class DataService {
     const [action] = Object.keys(body);
     const content = body[action] || {};
 
-    const { 
+    const {
       source: { type, name, view, filters = {} } = {},
-      params: { match: { lablesOnly = true, separator = "||" } = {}, grid: { maxCells = 5000, excludeDimensions = [] } = {}, lists = false } = {},
+      params: {
+        match: { lablesOnly = true, separator = "||" } = {},
+        grid: {
+          maxCells = 5000,
+          excludeDimensions = [],
+          rowStart = 0,
+          rowCount = -1,
+          chunkSize = 5000
+        } = {},
+        lists = false,
+        scope = 'Cells' // 'Dimensions', 'Items'
+      } = {},
       data = {},
       dimensions = {}
     } = content;
 
-    const ds = DataService.create({ type, name, view: view || undefined, filters, excludeDimensions });
+    const ds = DataService.create({
+      type, name, view: view || undefined, filters, excludeDimensions,
+      withoutValues: scope === 'Items' // header-only scope does not need cell values loaded
+    });
     if (ds.errorResponse) return ds.errorResponse;
 
     switch (action) {
       case Action.GET: {
-        const response = ds.getData(lablesOnly, separator, maxCells);
-        if (ds.grid) {
-          response.dimensions = ds.dimensions;
-          if (ds instanceof Multicube) {
-            if (lists) {
-              response.lists = ds.findLists();
-            }
-            if (ds.cubes) {
-              response.cubes = ds.cubes;
-            }
-          }
-        }
-        return response;
+        const ping = ds.respond();
+        if (ping) return ping;
+
+        const Reader = DataService.Scope[scope];
+        if (!Reader) return { status: "ERROR", message: `Unsupported scope: "${scope}"` };
+
+        return new Reader(ds, {
+          lablesOnly, separator, maxCells, chunkSize, rowCount, rowStart, lists
+        }).read();
       }
 
       case Action.PUT:
-        return ds.setData(data, dimensions, separator);
-      
+        return ds.write(data, dimensions, separator);
+
       default:
         return { status: "ERROR", message: `Unsupported action: ${action}` };
     }
@@ -148,29 +340,32 @@ class DataService {
   /**
    * Factory: instantiate the right subclass by type.
    * @param {Object} options
-   * @param {string} options.type       - One of SourceType values
+   * @param {string} options.type       - One of DataService.SourceType values
    * @param {string} [options.name]     - Name of the multicube or list (if applicable)
    * @param {string} [options.view]     - Name of the view (for LIST and MULTICUBE)
    * @param {Object<string,string[]>} [options.filters] - Filters to apply to the data
    * @param {string[]} [options.excludeDimensions] - Dimension names to exclude from page selectors / rows / columns
+   * @param {boolean} [options.withoutValues] - Apply pivot.withoutValues() (items scope)
    */
-  static create({ type, name, view, filters, excludeDimensions = [] }) {
+  static create({ type, name, view, filters, excludeDimensions = [], withoutValues = false }) {
     let ds;
+    const ST = DataService.SourceType;
     switch (type) {
-      case SourceType.PING:       ds = new Ping(type); break;
-      case SourceType.LISTS:      ds = new Lists(type, filters); break;   
-      case SourceType.MULTICUBES: ds = new Multicubes(type, filters);  break;
-      case SourceType.VERSIONS:   ds = new Versions(type, filters); break;
-      case SourceType.TIME:       ds = new Time(type, name, filters); break;
-      case SourceType.LIST:       ds = new List(type, name, view, filters); break; 
-      case SourceType.MULTICUBE:  ds = new Multicube(type, name, view, filters); break; 
-      case SourceType.CUBES:      ds = new Cubes(type, name, filters); break; 
+      case ST.PING:       ds = new Ping(type); break;
+      case ST.LISTS:      ds = new Lists(type, filters); break;
+      case ST.MULTICUBES: ds = new Multicubes(type, filters); break;
+      case ST.VERSIONS:   ds = new Versions(type, filters); break;
+      case ST.TIME:       ds = new Time(type, name, filters); break;
+      case ST.LIST:       ds = new List(type, name, view, filters); break;
+      case ST.MULTICUBE:  ds = new Multicube(type, name, view, filters); break;
+      case ST.CUBES:      ds = new Cubes(type, name, filters); break;
       default:
         ds = new DataService(type);
         ds.errorResponse = { status: "ERROR", data: {}, message: `Unsupported source type "${type}"` };
         return ds;
     }
     ds.excludeDimensions = new Set(excludeDimensions);
+    ds.useWithoutValues = withoutValues;
     try {
       ds.grid = ds.grid();
       if (ds.grid !== undefined && ds.grid !== null) {
@@ -188,6 +383,15 @@ class DataService {
    */
   grid() {
     throw new Error('grid() must be implemented by subclasses');
+  }
+
+  /**
+   * Applies pivot.withoutValues() when the items scope requested header-only loading.
+   * @param {object} pivot
+   * @returns {object}
+   */
+  withoutValues(pivot) {
+    return this.useWithoutValues ? pivot.withoutValues() : pivot;
   }
 
   /**
@@ -266,13 +470,37 @@ class DataService {
   }
 
   /**
-   * Invoked during getData traversal.
-   * @param {string} key - Item key
-   * @param {string} dimension - Dimension name
+   * Returns true when the given target passes the filter for the dimension, or when no filter is configured for that dimension.
+   * @param {string} dim
+   * @param {string} target
+   * @returns {boolean}
    */
-  onItemAdded(key, dimension) {
-    // Override in subclasses to collect specific data.
+  passesFilter(dim, target) {
+    const allowed = this.filters[dim];
+    return !allowed?.length || allowed.includes(target);
   }
+
+  /**
+   * Hook: called by Items/Cells scope readers when each label is added.
+   * Override in subclasses to collect subtype-specific metadata.
+   * @param {string} key
+   * @param {string} dimension
+   */
+  onItemAdded(key, dimension) {}
+
+  /**
+   * Hook: called by scope readers after traversal completes.
+   * Override in subclasses to perform post-traversal enrichment
+   */
+  afterRead() {}
+
+  /**
+   * Hook: called by performAction before scope dispatch.
+   * Return a non-null response object to bypass scope dispatch entirely.
+   * Override in subclasses that handle GET requests without a grid traversal.
+   * @returns {object|null}
+   */
+  respond() { return null; }
 
   /**
    * Builds MDX-style key from array of element keys: [Key1].[Key2].[Key3]
@@ -307,153 +535,13 @@ class DataService {
   }
 
   /**
-   * Gets data from the grid to JSON.
-   * @param {boolean} lablesOnly
-   * @returns {object}
-   */
-    getData(lablesOnly = true, separator = "||", maxCells = 5000, chunkSize = 5000, rowCount = 5000) {
-
-      const data = {};
-      const items = {};
-      this.message = "Data loaded";
-      let cellCount = 0;        // Counter for cells
-      const ordinalCount = {};  // Counter for ordinal per dimension
-      const dimItemsKeys = {};  // Set of keys already added to items[dimension]
-
-      try {
-        // Helper: bind makeKey with separator
-        const makeKey = (lbl) => this.makeKey(lbl, separator);
-
-        // Helper: check if element passes the filter
-        const checkFilter = (dimension, matchTarget) => {
-          const allowedSet = this.filters[dimension];
-          if (allowedSet?.length && !allowedSet.includes(matchTarget)) {
-            return false;
-          }
-          return true;
-        };
-
-        /**
-         * Appends one member to items[dimension] (unique keys per dimension).
-         * @param {string} key - Member key from makeKey() (label or label||name)
-         * @param {string|null} parent - Parent member key or null
-         * @param {string} dimension - Dimension name
-         */
-        const addToItems = (key, parent, dimension) => {
-          if (!dimItemsKeys[dimension]) dimItemsKeys[dimension] = new Set();
-          if (!items[dimension]) items[dimension] = [];
-
-          if (!dimItemsKeys[dimension].has(key)) {
-            dimItemsKeys[dimension].add(key);
-            if (!ordinalCount[dimension]) ordinalCount[dimension] = 0;
-            items[dimension].push({
-              key,
-              parent,
-              ordinal: ++ordinalCount[dimension],
-            });
-          }
-
-          this.onItemAdded(key, dimension);
-        };
-
-        const pageSelectorDimensionsSet = new Set(this.dimensions.pageSelectors || []);
-        const gridPageSelectors = this.grid
-          .getDefinitionInfo()
-          .getPageSelectors()
-          .filter((d) => pageSelectorDimensionsSet.has(d.getDimensionEntity().name()));
-
-        for (const pageSelector of gridPageSelectors) {
-          const dimensionName = pageSelector.getDimensionEntity().name();
-          const selected = pageSelector.getSelectedEntity();
-          if (!selected) continue;
-          const key = makeKey(selected);
-          const matchTarget = lablesOnly ? selected.label() : key;
-          if (!checkFilter(dimensionName, matchTarget)) continue;
-          addToItems(key, this.getKeyById(selected.parentLongId(), separator), dimensionName);
-        }
-
-        // Process rows and columns
-        const generator = this.grid.range(0, rowCount, 0, -1).generator(chunkSize);
-
-        for (const chunk of generator) {
-          const axis0Groups = chunk.rows().all();
-          const axis1Groups = chunk.columns().all();
-          
-          // Determine axis configuration based on view structure
-          // Default: axis0 = rows, axis1 = columns
-          // Inverted: axis0 = columns, axis1 = none (when no rows)
-          const hasAxis0 = axis0Groups && axis0Groups.length > 0;
-          const hasAxis1 = axis1Groups && axis1Groups.length > 0;
-          
-          if (!hasAxis0 && !hasAxis1) {
-            // Single cell view: no axes on rows and columns
-            const cellValue = chunk.cells().all()[0]?.getValue();
-            if (cellValue !== undefined) {
-              data['Value'] = cellValue;
-              cellCount++;
-            }
-            continue;
-          }
-          
-          if (!hasAxis0 && hasAxis1) {
-            if (this.dimensions.rows.length > 0) continue;
-
-            // Genuine inverted view: no row dimensions, columns are the only axis.
-            // Treat columns as primary axis (axis0).
-            const result = this.processViewDataRead({
-              chunk,
-              axis0Groups: axis1Groups,
-              axis1Groups: null,
-              axis0Dimensions: this.dimensions.columns,
-              axis1Dimensions: null,
-              data,
-              makeKey,
-              checkFilter,
-              addToItems,
-              lablesOnly,
-              separator,
-              maxCells,
-              cellCount
-            });
-            cellCount = result.cellCount;
-            continue;
-          }
-          
-          // Standard view: rows as axis0, columns as axis1
-          const result = this.processViewDataRead({
-            chunk,
-            axis0Groups,
-            axis1Groups,
-            axis0Dimensions: this.dimensions.rows,
-            axis1Dimensions: this.dimensions.columns,
-            data,
-            makeKey,
-            checkFilter,
-            addToItems,
-            lablesOnly,
-            separator,
-            maxCells,
-            cellCount
-          });
-          cellCount = result.cellCount;
-        }
-        
-        return { status: "OK", data, items, message: this.message };
-
-      } catch (e) {
-        this.message = String(e.message || e);
-        return { status: "ERROR", data, items, message: this.message };
-      }
-    }
-
-  /**
-   * Sets data to the grid from JSON.
+   * Writes data to the grid from JSON.
    * @param {object} data - Nested JSON data matching grid dimensions
    * @param {{ pageSelectors?: string[], rows: string[], columns: string[] }} dimensions - Dimensions from request
    * @param {string} separator - Separator for label||name keys
    * @returns {{ status: string, data: { updated: number }, message: string }}
    */
-  setData(data, dimensions, separator = "||", chunkSize = 5000, rowCount = 5000) {
+  write(data, dimensions, separator = "||", chunkSize = 5000, rowCount = 5000) {
     if (!this.validateDimensions(dimensions)) {
       return { status: "ERROR", data: { updated: 0 }, message: this.message };
     }
@@ -553,7 +641,7 @@ class DataService {
    * @param {Object} config
    * @returns {{ cellCount: number }}
    */
-  processViewDataRead(config) {
+  traverseCells(config) {
     const {
       chunk,
       axis0Groups,
@@ -561,14 +649,13 @@ class DataService {
       axis0Dimensions,
       axis1Dimensions,
       data,
-      makeKey,
-      checkFilter,
-      addToItems,
       lablesOnly,
       separator,
       maxCells,
-      cellCount: initialCellCount
+      cellCount: initialCellCount,
     } = config;
+
+    const makeKey = (lbl) => this.makeKey(lbl, separator);
     
     let cellCount = initialCellCount;
     
@@ -599,12 +686,10 @@ class DataService {
         const label = lbl.label();
         
         const matchTarget = lablesOnly ? label : key;
-        if (!checkFilter(axis0Dimensions[pos], matchTarget)) {
+        if (!this.passesFilter(axis0Dimensions[pos], matchTarget)) {
           skip = true;
           break;
         }
-        
-        addToItems(key, this.getKeyById(lbl.parentLongId(), separator), axis0Dimensions[pos]);
         
         if (!(key in axis0Cursor)) axis0Cursor[key] = {};
         lastAxis0Parent = axis0Cursor;
@@ -637,12 +722,10 @@ class DataService {
           const { key, label, parent } = thisAxis1Labels[i];
           
           const matchTarget = lablesOnly ? label : key;
-          if (!checkFilter(axis1Dimensions[i], matchTarget)) {
+          if (!this.passesFilter(axis1Dimensions[i], matchTarget)) {
             skip = true;
             break;
           }
-          
-          addToItems(key, parent, axis1Dimensions[i]);
           
           if (!(key in axis1Cursor)) axis1Cursor[key] = {};
           axis1Cursor = axis1Cursor[key];
@@ -653,11 +736,10 @@ class DataService {
         // Process axis1 leaf
         const leaf = thisAxis1Labels[thisAxis1Labels.length - 1];
         const matchTarget = lablesOnly ? leaf.label : leaf.key;
-        if (!checkFilter(axis1Dimensions[thisAxis1Labels.length - 1], matchTarget)) {
+        if (!this.passesFilter(axis1Dimensions[thisAxis1Labels.length - 1], matchTarget)) {
           return;
         }
         
-        addToItems(leaf.key, leaf.parent, axis1Dimensions[thisAxis1Labels.length - 1]);
         axis1Cursor[leaf.key] = cell.getValue();
         cellCount++;
       });
@@ -761,7 +843,7 @@ class Ping extends DataService {
     return undefined;
   }
 
-  getData() {
+  respond() {
     return {
       user: om.common.userInfo().getFirstName() + " " + om.common.userInfo().getLastName(),
       email: om.common.userInfo().getEmail(),
@@ -880,7 +962,7 @@ class List extends DataService {
 
   grid() {
     const pivot = om.lists.listsTab().open(this.name).pivot(this.view);
-    return this.applyColumnsFilter(pivot, 'Property').create();
+    return this.applyColumnsFilter(this.withoutValues(pivot), 'Property').create();
   }
 
   subsetGrid() {
@@ -912,39 +994,29 @@ class Multicube extends DataService {
   }
 
   grid() {
-    return om.multicubes
+    const pivot = om.multicubes
       .multicubesTab()
       .open(this.name)
-      .pivot(this.view)
-      .create();
+      .pivot(this.view);
+    return this.withoutValues(pivot).create();
   }
 
   /**
-   * Collects cube names during view traversal.
-   * @param {string} key - Item key
-   * @param {string} dimension - Dimension name
+   * Collects cube names during Items traversal.
+   * @param {string} key
+   * @param {string} dimension
    */
   onItemAdded(key, dimension) {
-    if (dimension === 'Cubes') {
-      this.viewCubes.add(key);
-    }
+    if (dimension === 'Cubes') this.viewCubes.add(key);
   }
 
   /**
-   * Gets data from the grid and enriches with cube information.
-   * @param {boolean} lablesOnly
-   * @param {string} separator
-   * @param {number} maxCells
-   * @returns {object}
+   * After Items traversal: load cube properties for all cubes encountered.
    */
-  getData(lablesOnly = true, separator = "||", maxCells = 5000, chunkSize = 5000, rowCount = 5000) {
-    const result = super.getData(lablesOnly, separator, maxCells, chunkSize, rowCount);
-    
+  afterRead() {
     if (this.viewCubes.size > 0) {
       this.cubes = this.getCubesInfo([...this.viewCubes]);
     }
-    
-    return result;
   }
 
   /**
@@ -956,7 +1028,7 @@ class Multicube extends DataService {
     const request = new Request({
       action: Action.GET,
       source: {
-        type: SourceType.CUBES,
+        type: DataService.SourceType.CUBES,
         name: this.name,
         filters: Object.assign(
           { "Cube Property": ["Formula", "Format", "Summary", "Time Summary"] },
@@ -969,7 +1041,7 @@ class Multicube extends DataService {
       }
     });
 
-    return request.execute().data || {};
+    return request.execute().cells || {};
   }
 
   /**
